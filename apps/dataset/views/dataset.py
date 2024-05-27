@@ -9,6 +9,7 @@
 
 from drf_yasg.utils import swagger_auto_schema
 from rest_framework.decorators import action
+from rest_framework.parsers import MultiPartParser
 from rest_framework.views import APIView
 from rest_framework.views import Request
 
@@ -43,6 +44,27 @@ class Dataset(APIView):
             return result.success(DataSetSerializers.SyncWeb(
                 data={'sync_type': request.query_params.get('sync_type'), 'id': dataset_id,
                       'user_id': str(request.user.id)}).sync())
+
+    class CreateQADataset(APIView):
+        authentication_classes = [TokenAuth]
+        parser_classes = [MultiPartParser]
+
+        @action(methods=['POST'], detail=False)
+        @swagger_auto_schema(operation_summary="创建QA知识库",
+                             operation_id="创建QA知识库",
+
+                             manual_parameters=DataSetSerializers.Create.CreateQASerializers.get_request_params_api(),
+                             responses=get_api_response(
+                                 DataSetSerializers.Create.CreateQASerializers.get_response_body_api()),
+                             tags=["知识库"]
+                             )
+        @has_permissions(PermissionConstants.DATASET_CREATE, compare=CompareConstants.AND)
+        def post(self, request: Request):
+            return result.success(DataSetSerializers.Create(data={'user_id': request.user.id}).save_qa({
+                'file_list': request.FILES.getlist('file'),
+                'name': request.data.get('name'),
+                'desc': request.data.get('desc')
+            }))
 
     class CreateWebDataset(APIView):
         authentication_classes = [TokenAuth]
@@ -114,6 +136,34 @@ class Dataset(APIView):
                                                  'similarity': request.query_params.get('similarity'),
                                                  'search_mode': request.query_params.get('search_mode')}).hit_test(
                 ))
+
+    class Embedding(APIView):
+        authentication_classes = [TokenAuth]
+
+        @action(methods="PUT", detail=False)
+        @swagger_auto_schema(operation_summary="重新向量化", operation_id="重新向量化",
+                             manual_parameters=DataSetSerializers.Operate.get_request_params_api(),
+                             responses=result.get_default_response(),
+                             tags=["知识库"]
+                             )
+        @has_permissions(lambda r, keywords: Permission(group=Group.DATASET, operate=Operate.MANAGE,
+                                                        dynamic_tag=keywords.get('dataset_id')))
+        def put(self, request: Request, dataset_id: str):
+            return result.success(
+                DataSetSerializers.Operate(data={'id': dataset_id, 'user_id': request.user.id}).re_embedding())
+
+    class Export(APIView):
+        authentication_classes = [TokenAuth]
+
+        @action(methods="GET", detail=False)
+        @swagger_auto_schema(operation_summary="导出知识库", operation_id="导出知识库",
+                             manual_parameters=DataSetSerializers.Operate.get_request_params_api(),
+                             tags=["知识库"]
+                             )
+        @has_permissions(lambda r, keywords: Permission(group=Group.DATASET, operate=Operate.MANAGE,
+                                                        dynamic_tag=keywords.get('dataset_id')))
+        def get(self, request: Request, dataset_id: str):
+            return DataSetSerializers.Operate(data={'id': dataset_id, 'user_id': request.user.id}).export_excel()
 
     class Operate(APIView):
         authentication_classes = [TokenAuth]

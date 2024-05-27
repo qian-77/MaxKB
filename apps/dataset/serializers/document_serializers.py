@@ -14,11 +14,14 @@ import uuid
 from functools import reduce
 from typing import List, Dict
 
+import xlwt
 from django.core import validators
 from django.db import transaction
 from django.db.models import QuerySet
+from django.http import HttpResponse
 from drf_yasg import openapi
 from rest_framework import serializers
+from xlwt import Utils
 
 from common.db.search import native_search, native_page_search
 from common.event.common import work_thread_pool
@@ -27,9 +30,12 @@ from common.exception.app_exception import AppApiException
 from common.handle.impl.doc_split_handle import DocSplitHandle
 from common.handle.impl.html_split_handle import HTMLSplitHandle
 from common.handle.impl.pdf_split_handle import PdfSplitHandle
+from common.handle.impl.qa.csv_parse_qa_handle import CsvParseQAHandle
+from common.handle.impl.qa.xls_parse_qa_handle import XlsParseQAHandle
+from common.handle.impl.qa.xlsx_parse_qa_handle import XlsxParseQAHandle
 from common.handle.impl.text_split_handle import TextSplitHandle
 from common.mixins.api_mixin import ApiMixin
-from common.util.common import post
+from common.util.common import post, flat_map
 from common.util.field_message import ErrMessage
 from common.util.file_util import get_file_content
 from common.util.fork import Fork
@@ -38,6 +44,17 @@ from dataset.models.data_set import DataSet, Document, Paragraph, Problem, Type,
 from dataset.serializers.common_serializers import BatchSerializer, MetaSerializer
 from dataset.serializers.paragraph_serializers import ParagraphSerializers, ParagraphInstanceSerializer
 from smartdoc.conf import PROJECT_DIR
+
+parse_qa_handle_list = [XlsParseQAHandle(), CsvParseQAHandle(), XlsxParseQAHandle()]
+
+
+class FileBufferHandle:
+    buffer = None
+
+    def get_buffer(self, file):
+        if self.buffer is None:
+            self.buffer = file.read()
+        return self.buffer
 
 
 class DocumentEditInstanceSerializer(ApiMixin, serializers.Serializer):
@@ -87,16 +104,19 @@ class DocumentWebInstanceSerializer(ApiMixin, serializers.Serializer):
                                          "选择器"))
 
     @staticmethod
-    def get_request_body_api():
-        return openapi.Schema(
-            type=openapi.TYPE_OBJECT,
-            required=['source_url_list'],
-            properties={
-                'source_url_list': openapi.Schema(type=openapi.TYPE_ARRAY, title="段落列表", description="段落列表",
-                                                  items=openapi.Schema(type=openapi.TYPE_STRING)),
-                'selector': openapi.Schema(type=openapi.TYPE_STRING, title="文档名称", description="文档名称")
-            }
-        )
+    def get_request_params_api():
+        return [openapi.Parameter(name='file',
+                                  in_=openapi.IN_FORM,
+                                  type=openapi.TYPE_ARRAY,
+                                  items=openapi.Items(type=openapi.TYPE_FILE),
+                                  required=True,
+                                  description='上传文件'),
+                openapi.Parameter(name='dataset_id',
+                                  in_=openapi.IN_PATH,
+                                  type=openapi.TYPE_STRING,
+                                  required=True,
+                                  description='知识库id'),
+                ]
 
 
 class DocumentInstanceSerializer(ApiMixin, serializers.Serializer):
@@ -120,7 +140,48 @@ class DocumentInstanceSerializer(ApiMixin, serializers.Serializer):
         )
 
 
+class DocumentInstanceQASerializer(ApiMixin, serializers.Serializer):
+    file_list = serializers.ListSerializer(required=True,
+                                           error_messages=ErrMessage.list("文件列表"),
+                                           child=serializers.FileField(required=True,
+                                                                       error_messages=ErrMessage.file("文件")))
+
+
 class DocumentSerializers(ApiMixin, serializers.Serializer):
+    class Export(ApiMixin, serializers.Serializer):
+        type = serializers.CharField(required=True, validators=[
+            validators.RegexValidator(regex=re.compile("^csv|excel$"),
+                                      message="模版类型只支持excel|csv",
+                                      code=500)
+        ], error_messages=ErrMessage.char("模版类型"))
+
+        @staticmethod
+        def get_request_params_api():
+            return [openapi.Parameter(name='type',
+                                      in_=openapi.IN_QUERY,
+                                      type=openapi.TYPE_STRING,
+                                      required=True,
+                                      description='导出模板类型csv|excel'),
+
+                    ]
+
+        def export(self, with_valid=True):
+            if with_valid:
+                self.is_valid(raise_exception=True)
+
+            if self.data.get('type') == 'csv':
+                file = open(os.path.join(PROJECT_DIR, "apps", "dataset", 'template', 'csv_template.csv'), "rb")
+                content = file.read()
+                file.close()
+                return HttpResponse(content, status=200, headers={'Content-Type': 'text/cxv',
+                                                                  'Content-Disposition': 'attachment; filename="csv_template.csv"'})
+            elif self.data.get('type') == 'excel':
+                file = open(os.path.join(PROJECT_DIR, "apps", "dataset", 'template', 'excel_template.xlsx'), "rb")
+                content = file.read()
+                file.close()
+                return HttpResponse(content, status=200, headers={'Content-Type': 'application/vnd.ms-excel',
+                                                                  'Content-Disposition': 'attachment; filename="excel_template.xlsx"'})
+
     class Migrate(ApiMixin, serializers.Serializer):
         dataset_id = serializers.UUIDField(required=True,
                                            error_messages=ErrMessage.char(
@@ -364,6 +425,85 @@ class DocumentSerializers(ApiMixin, serializers.Serializer):
             if not QuerySet(Document).filter(id=document_id).exists():
                 raise AppApiException(500, "文档id不存在")
 
+        def export(self, with_valid=True):
+            if with_valid:
+                self.is_valid(raise_exception=True)
+            document = QuerySet(Document).filter(id=self.data.get("document_id")).first()
+            paragraph_list = native_search(QuerySet(Paragraph).filter(document_id=self.data.get("document_id")),
+                                           get_file_content(
+                                               os.path.join(PROJECT_DIR, "apps", "dataset", 'sql',
+                                                            'list_paragraph_document_name.sql')))
+            problem_mapping_list = native_search(
+                QuerySet(ProblemParagraphMapping).filter(document_id=self.data.get("document_id")), get_file_content(
+                    os.path.join(PROJECT_DIR, "apps", "dataset", 'sql', 'list_problem_mapping.sql')),
+                with_table_name=True)
+            data_dict, document_dict = self.merge_problem(paragraph_list, problem_mapping_list, [document])
+            workbook = self.get_workbook(data_dict, document_dict)
+            response = HttpResponse(content_type='application/vnd.ms-excel')
+            response['Content-Disposition'] = f'attachment; filename="data.xls"'
+            workbook.save(response)
+            return response
+
+        @staticmethod
+        def get_workbook(data_dict, document_dict):
+            # 创建工作簿对象
+            workbook = xlwt.Workbook(encoding='utf-8')
+            for sheet_id in data_dict:
+                # 添加工作表
+                worksheet = workbook.add_sheet(document_dict.get(sheet_id))
+                data = [
+                    ['分段标题（选填）', '分段内容（必填，问题答案，最长不超过4096个字符）', '问题（选填，单元格内一行一个）'],
+                    *data_dict.get(sheet_id)
+                ]
+                # 写入数据到工作表
+                for row_idx, row in enumerate(data):
+                    for col_idx, col in enumerate(row):
+                        worksheet.write(row_idx, col_idx, col)
+                    # 创建HttpResponse对象返回Excel文件
+            return workbook
+
+        @staticmethod
+        def merge_problem(paragraph_list: List[Dict], problem_mapping_list: List[Dict], document_list):
+            result = {}
+            document_dict = {}
+
+            for paragraph in paragraph_list:
+                problem_list = [problem_mapping.get('content') for problem_mapping in problem_mapping_list if
+                                problem_mapping.get('paragraph_id') == paragraph.get('id')]
+                document_sheet = result.get(paragraph.get('document_id'))
+                document_name = DocumentSerializers.Operate.reset_document_name(paragraph.get('document_name'))
+                d = document_dict.get(document_name)
+                if d is None:
+                    document_dict[document_name] = {paragraph.get('document_id')}
+                else:
+                    d.add(paragraph.get('document_id'))
+
+                if document_sheet is None:
+                    result[paragraph.get('document_id')] = [[paragraph.get('title'), paragraph.get('content'),
+                                                             '\n'.join(problem_list)]]
+                else:
+                    document_sheet.append([paragraph.get('title'), paragraph.get('content'), '\n'.join(problem_list)])
+            for document in document_list:
+                if document.id not in result:
+                    document_name = DocumentSerializers.Operate.reset_document_name(document.name)
+                    result[document.id] = [[]]
+                    d = document_dict.get(document_name)
+                    if d is None:
+                        document_dict[document_name] = {document.id}
+                    else:
+                        d.add(document.id)
+            result_document_dict = {}
+            for d_name in document_dict:
+                for index, d_id in enumerate(document_dict.get(d_name)):
+                    result_document_dict[d_id] = d_name if index == 0 else d_name + str(index)
+            return result, result_document_dict
+
+        @staticmethod
+        def reset_document_name(document_name):
+            if document_name is None or not Utils.valid_sheet_name(document_name):
+                return "Sheet"
+            return document_name.strip()
+
         def one(self, with_valid=False):
             if with_valid:
                 self.is_valid(raise_exception=True)
@@ -389,18 +529,7 @@ class DocumentSerializers(ApiMixin, serializers.Serializer):
             if with_valid:
                 self.is_valid(raise_exception=True)
             document_id = self.data.get("document_id")
-            document = QuerySet(Document).filter(id=document_id).first()
-            if document.type == Type.web:
-                # 异步同步
-                work_thread_pool.submit(lambda x: DocumentSerializers.Sync(data={'document_id': document_id}).sync(),
-                                        {})
-
-            else:
-                if document.status != Status.embedding.value:
-                    document.status = Status.embedding
-                    document.save()
-                ListenerManagement.embedding_by_document_signal.send(document_id)
-            return True
+            ListenerManagement.embedding_by_document_signal.send(document_id)
 
         @transaction.atomic
         def delete(self):
@@ -472,6 +601,22 @@ class DocumentSerializers(ApiMixin, serializers.Serializer):
         def post_embedding(result, document_id):
             ListenerManagement.embedding_by_document_signal.send(document_id)
             return result
+
+        @staticmethod
+        def parse_qa_file(file):
+            get_buffer = FileBufferHandle().get_buffer
+            for parse_qa_handle in parse_qa_handle_list:
+                if parse_qa_handle.support(file, get_buffer):
+                    return parse_qa_handle.handle(file, get_buffer)
+            raise AppApiException(500, '不支持的文件格式')
+
+        def save_qa(self, instance: Dict, with_valid=True):
+            if with_valid:
+                DocumentInstanceQASerializer(data=instance).is_valid(raise_exception=True)
+                self.is_valid(raise_exception=True)
+            file_list = instance.get('file_list')
+            document_list = flat_map([self.parse_qa_file(file) for file in file_list])
+            return DocumentSerializers.Batch(data={'dataset_id': self.data.get('dataset_id')}).batch_save(document_list)
 
         @post(post_function=post_embedding)
         @transaction.atomic
@@ -714,6 +859,8 @@ class DocumentSerializers(ApiMixin, serializers.Serializer):
                 problem_paragraph_mapping_list) > 0 else None
             # 查询文档
             query_set = QuerySet(model=Document)
+            if len(document_model_list) == 0:
+                return [],
             query_set = query_set.filter(**{'id__in': [d.id for d in document_model_list]})
             return native_search(query_set, select_string=get_file_content(
                 os.path.join(PROJECT_DIR, "apps", "dataset", 'sql', 'list_document.sql')), with_search_one=False),

@@ -22,6 +22,18 @@ from dataset.serializers.document_serializers import DocumentSerializers, Docume
 from dataset.swagger_api.document_api import DocumentApi
 
 
+class Template(APIView):
+    authentication_classes = [TokenAuth]
+
+    @action(methods=['GET'], detail=False)
+    @swagger_auto_schema(operation_summary="获取QA模版",
+                         operation_id="获取QA模版",
+                         manual_parameters=DocumentSerializers.Export.get_request_params_api(),
+                         tags=["知识库/文档"])
+    def get(self, request: Request):
+        return DocumentSerializers.Export(data={'type': request.query_params.get('type')}).export(with_valid=True)
+
+
 class WebDocument(APIView):
     authentication_classes = [TokenAuth]
 
@@ -38,6 +50,26 @@ class WebDocument(APIView):
     def post(self, request: Request, dataset_id: str):
         return result.success(
             DocumentSerializers.Create(data={'dataset_id': dataset_id}).save_web(request.data, with_valid=True))
+
+
+class QaDocument(APIView):
+    authentication_classes = [TokenAuth]
+    parser_classes = [MultiPartParser]
+
+    @action(methods=['POST'], detail=False)
+    @swagger_auto_schema(operation_summary="导入QA并创建文档",
+                         operation_id="导入QA并创建文档",
+                         manual_parameters=DocumentWebInstanceSerializer.get_request_params_api(),
+                         responses=result.get_api_response(DocumentSerializers.Create.get_response_body_api()),
+                         tags=["知识库/文档"])
+    @has_permissions(
+        lambda r, k: Permission(group=Group.DATASET, operate=Operate.MANAGE,
+                                dynamic_tag=k.get('dataset_id')))
+    def post(self, request: Request, dataset_id: str):
+        return result.success(
+            DocumentSerializers.Create(data={'dataset_id': dataset_id}).save_qa(
+                {'file_list': request.FILES.getlist('file')},
+                with_valid=True))
 
 
 class Document(APIView):
@@ -136,6 +168,24 @@ class Document(APIView):
         def delete(self, request: Request, dataset_id: str):
             return result.success(DocumentSerializers.Batch(data={'dataset_id': dataset_id}).batch_delete(request.data))
 
+    class SyncWeb(APIView):
+        authentication_classes = [TokenAuth]
+
+        @action(methods=['PUT'], detail=False)
+        @swagger_auto_schema(operation_summary="同步web站点类型",
+                             operation_id="同步web站点类型",
+                             manual_parameters=DocumentSerializers.Operate.get_request_params_api(),
+                             responses=result.get_default_response(),
+                             tags=["知识库/文档"]
+                             )
+        @has_permissions(
+            lambda r, k: Permission(group=Group.DATASET, operate=Operate.MANAGE,
+                                    dynamic_tag=k.get('dataset_id')))
+        def put(self, request: Request, dataset_id: str, document_id: str):
+            return result.success(
+                DocumentSerializers.Sync(data={'document_id': document_id, 'dataset_id': dataset_id}).sync(
+                ))
+
     class Refresh(APIView):
         authentication_classes = [TokenAuth]
 
@@ -179,6 +229,20 @@ class Document(APIView):
                           'document_id_list': request.data}).migrate(
 
                 ))
+
+    class Export(APIView):
+        authentication_classes = [TokenAuth]
+
+        @action(methods=['GET'], detail=False)
+        @swagger_auto_schema(operation_summary="导出文档",
+                             operation_id="导出文档",
+                             manual_parameters=DocumentSerializers.Operate.get_request_params_api(),
+                             tags=["知识库/文档"])
+        @has_permissions(
+            lambda r, k: Permission(group=Group.DATASET, operate=Operate.USE,
+                                    dynamic_tag=k.get('dataset_id')))
+        def get(self, request: Request, dataset_id: str, document_id: str):
+            return DocumentSerializers.Operate(data={'document_id': document_id, 'dataset_id': dataset_id}).export()
 
     class Operate(APIView):
         authentication_classes = [TokenAuth]
