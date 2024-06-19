@@ -54,3 +54,4 @@ EXPOSE 8080
 
 ENTRYPOINT ["bash", "-c"]
 CMD [ "/usr/bin/run-maxkb.sh" ]
+
